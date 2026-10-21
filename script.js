@@ -1,6 +1,10 @@
 import { renderLessons, lessons } from './lessons.js';
 import { renderAchievements } from './achievements.js';
-import { initializeSimulator } from './simulator.js';
+import { achievements } from './achievements.js';
+import { renderMissions, missions } from './missions.js';
+import { createInstructor } from './instructor.js';
+import { initializeSimulator, initializeCockpitPractice } from './simulator.js';
+import { ensureLessonProgress, canStartLesson, completeTheory as markTheoryComplete, completeQuiz as recordQuiz, enterPractice, completePractice as markPracticeComplete, canCompleteLesson, completeLesson as markLessonComplete } from './lesson-engine.mjs';
 
 const pageTitles = { home: 'Главная', learning: 'Обучение', simulator: '3D-симулятор', missions: 'Миссии', tests: 'Тесты', profile: 'Мой профиль', achievements: 'Достижения', settings: 'Настройки' };
 const storageKey = 'aeropilot-state-v1';
@@ -9,12 +13,12 @@ const levelSteps = [
   { name: 'Курсант', xp: 0 }, { name: 'Начинающий пилот', xp: 500 }, { name: 'Младший пилот', xp: 1200 },
   { name: 'Опытный курсант', xp: 2500 }, { name: 'Выпускник учебного курса', xp: 5000 },
 ];
-const blankProfile = (user) => ({ nickname: user.nickname, email: user.email, trainingLevel: user.trainingLevel, xp: 0, completedLessons: [], completedMissions: [], completedTests: [], testResults: {}, achievements: [] });
+const blankProfile = (user) => ({ nickname: user.nickname, email: user.email, trainingLevel: user.trainingLevel, xp: 0, completedLessons: [], completedMissions: [], completedTests: [], testResults: {}, achievements: [], achievementDates: {}, rewardedAchievements: [], lessonProgress: {}, missionProgress: {} });
 let state;
 let users;
 try {
   const stored = JSON.parse(localStorage.getItem(storageKey) || '{}');
-  const legacyProfile = stored.profiles ? null : { nickname: 'Алексей К.', email: '', trainingLevel: 'Новичок', xp: Number(stored.xp) || 0, completedLessons: [], completedMissions: [], completedTests: [], testResults: {}, achievements: [] };
+  const legacyProfile = stored.profiles ? null : { nickname: 'Алексей К.', email: '', trainingLevel: 'Новичок', xp: Number(stored.xp) || 0, completedLessons: [], completedMissions: [], completedTests: [], testResults: {}, achievements: [], achievementDates: {}, rewardedAchievements: [], lessonProgress: {}, missionProgress: {} };
   state = { theme: stored.theme === 'light' ? 'light' : 'dark', sessionEmail: stored.sessionEmail || '', profiles: stored.profiles || (legacyProfile ? { guest: legacyProfile } : {}) };
   const savedUsers = JSON.parse(localStorage.getItem(usersKey) || '[]');
   users = Array.isArray(savedUsers) ? savedUsers : [];
@@ -28,6 +32,10 @@ for (const savedProfile of Object.values(state.profiles)) {
   savedProfile.completedTests ||= [];
   savedProfile.testResults ||= {};
   savedProfile.achievements ||= [];
+  savedProfile.achievementDates ||= {};
+  savedProfile.rewardedAchievements ||= [];
+  savedProfile.lessonProgress ||= {};
+  savedProfile.missionProgress ||= {};
   savedProfile.completedLessons = [...new Set(savedProfile.completedLessons)];
   savedProfile.completedTests = [...new Set(savedProfile.completedTests)];
 }
@@ -40,6 +48,8 @@ const toast = (message) => {
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => element.classList.remove('show'), 2800);
 };
+const instructor = createInstructor(document.querySelector('#instructor-widget'));
+let missionSession = null;
 
 function applyTheme(theme) {
   state.theme = theme === 'light' ? 'light' : 'dark';
@@ -56,7 +66,8 @@ function navigate(page) {
   document.querySelector('#breadcrumb-title').textContent = pageTitles[page];
   document.querySelector('#sidebar').classList.remove('open');
   history.replaceState(null, '', `#${page}`);
-  if (page === 'simulator' && !window.aeroSimulator) window.aeroSimulator = initializeSimulator(document.querySelector('#simulator-canvas'));
+  if (page === 'simulator' && !window.aeroSimulator) window.aeroSimulator = initializeSimulator(document.querySelector('#simulator-root'), { onExit: () => navigate('home'), onInstrumentSelect: onSimulatorInstrument });
+  if (window.aeroSimulator) window.aeroSimulator.setActive(page === 'simulator');
   if (page === 'profile') renderProfile();
   if (page === 'tests') {
     const completed = profile()?.completedTests.includes('basic-heading') || false;
@@ -89,16 +100,17 @@ function refreshDashboard() {
   document.querySelector('.stat-card:nth-child(2) .stat-foot span:last-child').textContent = level.next ? `${level.next.xp} XP` : 'MAX';
   const greeting = current?.nickname || 'будущий пилот';
   document.querySelector('#welcome-title').innerHTML = `Доброе утро, ${escapeHtml(greeting)} <span class="wave">✦</span>`;
-  const earned = current?.achievements || [];
+  const earned = (current?.achievements || []).filter((id) => achievements.some((item) => item.id === id));
   document.querySelector('#nav-achievement-count').textContent = earned.length;
-  renderAchievements(document.querySelector('#recent-achievements'), { recent: true, earnedIds: earned });
-  renderAchievements(document.querySelector('#all-achievements'), { earnedIds: earned });
-  renderLessons(document.querySelector('#course-grid'), { onStart: startLesson, completedIds: current?.completedLessons || [] });
-  renderLessons(document.querySelector('#all-course-grid'), { onStart: startLesson, completedIds: current?.completedLessons || [] });
-  const missionButton = document.querySelector('#complete-mission');
-  const missionDone = current?.completedMissions.includes('preflight-check') || false;
-  missionButton.disabled = missionDone;
-  missionButton.textContent = missionDone ? 'Задание выполнено ✓' : 'Отметить выполнение · +50 XP';
+  const achievementDates = current?.achievementDates || {};
+  renderAchievements(document.querySelector('#recent-achievements'), { recent: true, earnedIds: earned, achievementDates });
+  renderAchievements(document.querySelector('#all-achievements'), { earnedIds: earned, achievementDates });
+  const progressMap = current?.lessonProgress || {};
+  renderLessons(document.querySelector('#course-grid'), { onStart: startLesson, completedIds: current?.completedLessons || [], progressMap });
+  renderLessons(document.querySelector('#all-course-grid'), { onStart: startLesson, completedIds: current?.completedLessons || [], progressMap });
+  const missionProgress = current?.missionProgress || {};
+  renderMissions(document.querySelector('#mission-grid'), { progressMap: missionProgress, completedIds: current?.completedMissions || [], onStart: startMission });
+  document.querySelector('#mission-progress-count').textContent = `${missions.filter((mission) => current?.completedMissions.includes(mission.id)).length} из ${missions.length} миссий`;
 }
 
 function renderProfile() {
@@ -132,13 +144,13 @@ function renderProfile() {
   document.querySelector('#profile-missions').textContent = current.completedMissions.length;
   const completedNames = current.completedLessons.map((id) => lessons.find((lesson) => lesson.id === id)?.title).filter(Boolean);
   document.querySelector('#profile-completed-list').innerHTML = completedNames.length ? completedNames.map((name) => `<div class="detail-row"><span>✓ ${escapeHtml(name)}</span><b>Пройден</b></div>`).join('') : '<span class="detail-empty">Пока нет пройденных уроков</span>';
-  const missions = { 'preflight-check': 'Предполётная проверка' };
-  document.querySelector('#profile-mission-list').innerHTML = current.completedMissions.length ? current.completedMissions.map((id) => `<div class="detail-row"><span>✓ ${escapeHtml(missions[id] || id)}</span><b>Выполнена</b></div>`).join('') : '<span class="detail-empty">Пока нет выполненных миссий</span>';
+  const missionNames = Object.fromEntries(missions.map((mission) => [mission.id, mission.title]));
+  document.querySelector('#profile-mission-list').innerHTML = current.completedMissions.length ? current.completedMissions.map((id) => `<div class="detail-row"><span>✓ ${escapeHtml(missionNames[id] || id)}</span><b>Выполнена</b></div>`).join('') : '<span class="detail-empty">Пока нет выполненных миссий</span>';
   const tests = Object.entries(current.testResults || {});
   document.querySelector('#profile-test-results').innerHTML = tests.length ? tests.map(([name, result]) => `<div class="detail-row"><span>${escapeHtml(name)}</span><b>${result}%</b></div>`).join('') : '<span class="detail-empty">Пока нет результатов тестов</span>';
-  const earned = current.achievements || [];
-  const names = { 'first-steps': 'Первые шаги', 'three-lessons': 'Первый вылет', 'streak-seven': 'Небо зовёт', 'radio-ready': 'На связи', 'navigator': 'Штурман', 'first-test': 'Проверка пройдена', 'mission-one': 'Первое задание' };
-  document.querySelector('#profile-achievements').innerHTML = earned.length ? earned.map((id) => `<div class="detail-row"><span>✦ ${escapeHtml(names[id] || id)}</span><b>Получено</b></div>`).join('') : '<span class="detail-empty">Здесь появятся твои награды</span>';
+  const earned = (current.achievements || []).filter((id) => achievements.some((item) => item.id === id));
+  const achievementNames = Object.fromEntries(achievements.map((item) => [item.id, item.title]));
+  document.querySelector('#profile-achievements').innerHTML = earned.length ? earned.map((id) => `<div class="detail-row"><span>✦ ${escapeHtml(achievementNames[id] || id)}</span><b>${current.achievementDates?.[id] ? new Date(current.achievementDates[id]).toLocaleDateString('ru-RU') : 'Получено'}</b></div>`).join('') : '<span class="detail-empty">Здесь появятся твои награды</span>';
   const best = tests.length ? Math.max(...tests.map(([, value]) => value)) : null;
   document.querySelector('#best-test').textContent = best === null ? '—' : `${best}%`;
 }
@@ -149,8 +161,22 @@ function escapeHtml(text) {
 
 function addAchievement(id) {
   const current = profile();
-  if (!current || current.achievements.includes(id)) return;
+  const definition = achievements.find((item) => item.id === id);
+  if (!current || !definition || current.achievements.includes(id)) return false;
   current.achievements.push(id);
+  current.achievementDates ||= {};
+  current.rewardedAchievements ||= [];
+  current.achievementDates[id] = new Date().toISOString();
+  if (!current.rewardedAchievements.includes(id)) {
+    current.rewardedAchievements.push(id);
+    current.xp += definition.rewardXp;
+  }
+  saveState();
+  refreshDashboard();
+  renderProfile();
+  instructor?.achievement(definition.title);
+  toast(`Достижение «${definition.title}»: +${definition.rewardXp} XP`);
+  return true;
 }
 
 function awardXp(amount, label, uniqueId, collection) {
@@ -159,10 +185,6 @@ function awardXp(amount, label, uniqueId, collection) {
   if (current[collection].includes(uniqueId)) { toast('Это задание уже отмечено как выполненное'); return false; }
   current[collection].push(uniqueId);
   current.xp += amount;
-  if (collection === 'completedLessons') addAchievement('first-steps');
-  if (current.completedLessons.length >= 3) addAchievement('three-lessons');
-  if (collection === 'completedTests') addAchievement('first-test');
-  if (collection === 'completedMissions') addAchievement('mission-one');
   saveState();
   refreshDashboard();
   renderProfile();
@@ -171,13 +193,51 @@ function awardXp(amount, label, uniqueId, collection) {
 }
 
 let lessonSession = null;
-const lessonStepNames = ['ТЕОРИЯ', 'ИНТЕРАКТИВНАЯ ПРАКТИКА', 'ТЕСТ', 'РЕЗУЛЬТАТ'];
+let lessonPracticeController = null;
+const lessonStepNames = ['ТЕОРИЯ', 'ПРОВЕРКА ЗНАНИЙ', 'ПРАКТИКА', 'РЕЗУЛЬТАТ'];
+const quizPassMark = 80;
+
+function getLessonProgress(id) {
+  const current = profile();
+  if (!current) return null;
+  return ensureLessonProgress(current, id);
+}
+
+function persistLessonProgress(status, patch = {}) {
+  const record = getLessonProgress(lessonSession.lesson.id);
+  if (!record) return;
+  Object.assign(record, patch);
+  if (record.status !== 'completed') record.status = status;
+  saveState();
+  refreshDashboard();
+}
 
 function startLesson(lesson, locked = false) {
   if (!lesson) return;
   if (locked) { toast('Сначала заверши предыдущий урок'); return; }
   if (!profile()) { toast('Сначала создай профиль курсанта'); navigate('profile'); return; }
-  lessonSession = { lesson, step: 'theory', questionIndex: 0, correct: 0, answered: false, practiceCorrect: false, result: null, practiceOrder: shuffledIndexes(lesson.practice.options.length), quizOrders: lesson.quiz.map((question) => shuffledIndexes(question.options.length)) };
+  const lessonIndex = lessons.findIndex((item) => item.id === lesson.id);
+  const current = profile();
+  if (!canStartLesson(lessons, current, lesson.id)) { toast('Сначала заверши предыдущий урок'); return; }
+  const saved = getLessonProgress(lesson.id);
+  const replay = saved.status === 'completed';
+  const step = replay ? 'theory' : saved.status;
+  const quizAttempt = replay ? { questionIndex: 0, correct: 0, answered: false, lastCorrect: false, errors: 0 } : saved.quizAttempt;
+  lessonSession = {
+    lesson, step, replay, questionIndex: quizAttempt.questionIndex, correct: quizAttempt.correct,
+    answered: quizAttempt.answered, lastCorrect: quizAttempt.lastCorrect, errors: quizAttempt.errors,
+    quizOutcome: replay ? '' : (saved.quizOutcome || ''), quizBest: current.testResults[lesson.title] || 0,
+    quizPercent: replay ? undefined : saved.lastQuizScore, quizCorrect: replay ? undefined : saved.lastQuizCorrect,
+    practiceChoice: undefined, practiceCompleted: replay ? false : saved.practiceCompleted,
+    practiceErrors: replay ? 0 : saved.practiceErrors, completedPracticeTasks: replay ? [] : saved.completedPracticeTasks,
+    result: null, practiceOrder: lesson.practice.options ? shuffledIndexes(lesson.practice.options.length) : [],
+    quizOrders: lesson.quiz.map((question) => shuffledIndexes(question.options.length)),
+  };
+  instructor?.lessonStart(lesson);
+  if (!replay && saved.status !== 'completed') {
+    saved.status ||= 'theory';
+    persistLessonProgress(saved.status);
+  }
   document.querySelector('#lesson-dialog [data-lesson-title]').textContent = lesson.title;
   renderLessonStep();
   document.querySelector('#lesson-dialog').showModal();
@@ -194,60 +254,296 @@ function shuffledIndexes(length) {
 
 function renderLessonStep() {
   if (!lessonSession) return;
+  lessonPracticeController?.dispose?.();
+  lessonPracticeController = null;
   const { lesson, step, questionIndex } = lessonSession;
   const stage = document.querySelector('#lesson-stage');
-  const dialog = document.querySelector('#lesson-dialog');
-  const stepNum = step === 'theory' ? 1 : step === 'practice' ? 2 : step === 'quiz' ? questionIndex + 3 : 6;
-  document.querySelector('#lesson-step-count').textContent = step === 'result' ? 'ГОТОВО' : `${stepNum} / 5`;
-  document.querySelector('#lesson-overall-progress').style.width = step === 'result' ? '100%' : `${stepNum / 5 * 100}%`;
-  document.querySelector('#lesson-step-label').textContent = `${lesson.title.toLocaleUpperCase('ru')} · ${lessonStepNames[step === 'theory' ? 0 : step === 'practice' ? 1 : step === 'quiz' ? 2 : 3]}`;
+  const stepNum = step === 'theory' ? 1 : step === 'quiz' ? 2 : step === 'practice' ? 3 : 4;
+  document.querySelector('#lesson-step-count').textContent = step === 'result' ? 'ГОТОВО' : `${stepNum} / 4`;
+  document.querySelector('#lesson-overall-progress').style.width = `${stepNum / 4 * 100}%`;
+  document.querySelector('#lesson-step-label').textContent = `${lesson.title.toLocaleUpperCase('ru')} · ${lessonStepNames[step === 'theory' ? 0 : step === 'quiz' ? 1 : step === 'practice' ? 2 : 3]}`;
 
   if (step === 'theory') {
-    stage.innerHTML = `<div class="lesson-scroll"><div class="lesson-intro"><span class="course-icon ${lesson.tone}">${lesson.icon}</span><div><span class="eyebrow">ТЕОРИЯ</span><p>Разберись в теме простыми шагами. Затем попробуй применить знания.</p></div></div><div class="lesson-reading">${lesson.theory.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('')}</div><div class="lesson-diagram"><div class="diagram-title">СХЕМА · ${escapeHtml(lesson.title.toLocaleUpperCase('ru'))}</div><div class="diagram-grid">${lesson.diagram.map((item, index) => `<article class="diagram-item" style="--item-order:${index}"><span>${escapeHtml(item.icon)}</span><b>${escapeHtml(item.title)}</b><small>${escapeHtml(item.text)}</small></article>`).join('')}</div></div><div class="lesson-safety-note">Учебный материал для знакомства с темой. Практические полёты выполняй только с инструктором и по руководству конкретного самолёта.</div><button class="button-primary lesson-next" data-lesson-next="practice">К практике <span>→</span></button></div>`;
-    return;
-  }
-
-  if (step === 'practice') {
-    const practiceFeedback = lessonSession.practiceChoice === undefined ? '' : `<div class="answer-explanation ${lessonSession.practiceCorrect ? 'is-correct' : 'is-wrong'}" id="practice-explanation" aria-live="polite"><b>${lessonSession.practiceCorrect ? 'Именно так.' : `Неверно. Правильный вариант: ${escapeHtml(lesson.practice.options[lesson.practice.answer])}`}</b><p>${escapeHtml(lesson.practice.explanation)}</p></div>`;
-    stage.innerHTML = `<div class="lesson-scroll"><span class="pill-blue">ПОПРОБУЙ САМ</span><h3 class="lesson-prompt">${escapeHtml(lesson.practice.prompt)}</h3><div class="practice-options">${lessonSession.practiceOrder.map((index) => lesson.practice.options[index]).map((option, shownIndex) => { const originalIndex = lessonSession.practiceOrder[shownIndex]; return `<button class="practice-option ${lessonSession.practiceChoice === originalIndex ? (lessonSession.practiceCorrect ? 'selected-correct' : 'selected-wrong') : ''}" data-practice-answer="${originalIndex}" ${lessonSession.practiceCorrect ? 'disabled' : ''}>${escapeHtml(option)}</button>`; }).join('')}</div>${practiceFeedback}<button class="button-primary lesson-next" data-lesson-next="quiz" ${lessonSession.practiceCorrect ? '' : 'disabled'}>Перейти к тесту <span>→</span></button></div>`;
+    stage.innerHTML = `<div class="lesson-scroll"><div class="lesson-intro"><span class="course-icon ${lesson.tone}">${lesson.icon}</span><div><span class="eyebrow">ТЕОРИЯ</span><p>Разберись в теме простыми шагами. Затем проверь знания.</p></div></div><div class="lesson-reading">${lesson.theory.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('')}</div><div class="lesson-diagram"><div class="diagram-title">СХЕМА · ${escapeHtml(lesson.title.toLocaleUpperCase('ru'))}</div><div class="diagram-grid">${lesson.diagram.map((item, index) => `<article class="diagram-item" style="--item-order:${index}"><span>${escapeHtml(item.icon)}</span><b>${escapeHtml(item.title)}</b><small>${escapeHtml(item.text)}</small></article>`).join('')}</div></div><div class="lesson-safety-note">Учебный материал для знакомства с темой. Практические полёты выполняй только с инструктором и по руководству конкретного самолёта.</div><button class="button-primary lesson-next" data-complete-theory>Далее к проверке знаний <span>→</span></button></div>`;
     return;
   }
 
   if (step === 'quiz') {
+    if (lessonSession.quizOutcome) {
+      const passed = lessonSession.quizOutcome === 'passed';
+      stage.innerHTML = `<div class="lesson-result ${passed ? 'passed' : 'retry'}"><div class="result-medal">${passed ? '✓' : '↻'}</div><span class="eyebrow">ПРОВЕРКА ЗНАНИЙ</span><h3>${passed ? 'Тест пройден' : 'Порог пока не достигнут'}</h3><div class="result-score"><strong>${lessonSession.quizCorrect ?? lessonSession.correct}</strong><span>из ${lesson.quiz.length} правильных</span><b>${lessonSession.quizPercent ?? Math.round(lessonSession.correct / lesson.quiz.length * 100)}%</b></div><p>${passed ? 'Отлично! Теперь выполни практическое задание, чтобы завершить урок.' : `Нужно набрать не менее ${quizPassMark}%. Изучи объяснения и попробуй снова.`}</p><div class="result-actions">${passed ? '<button class="button-primary" data-quiz-continue>Перейти к практике <span>→</span></button>' : '<button class="button-secondary" data-retry-quiz>Повторить тест</button>'}</div></div>`;
+      return;
+    }
     const question = lesson.quiz[questionIndex];
     const order = lessonSession.quizOrders[questionIndex];
     const feedback = lessonSession.answered
-      ? `<div class="answer-explanation ${lessonSession.lastCorrect ? 'is-correct' : 'is-wrong'}"><b>${lessonSession.lastCorrect ? 'Верно!' : `Неверно. Правильный ответ: ${escapeHtml(question.options[question.answer])}`}</b><p>${escapeHtml(question.explanation)}</p></div><button class="button-primary lesson-next" data-quiz-next>${questionIndex < lesson.quiz.length - 1 ? 'Следующий вопрос' : 'Показать результат'} <span>→</span></button>`
+      ? `<div class="answer-explanation ${lessonSession.lastCorrect ? 'is-correct' : 'is-wrong'}"><b>${lessonSession.lastCorrect ? 'Верно!' : `Неверно. Правильный ответ: ${escapeHtml(question.options[question.answer])}`}</b><p>${escapeHtml(question.explanation)}</p></div><button class="button-primary lesson-next" data-quiz-next>${questionIndex < lesson.quiz.length - 1 ? 'Следующий вопрос' : 'Проверить результат'} <span>→</span></button>`
       : '';
-    stage.innerHTML = `<div class="lesson-scroll"><div class="quiz-progress"><span>ВОПРОС ${questionIndex + 1} ИЗ ${lesson.quiz.length}</span><span>${lessonSession.correct} верно</span></div><h3 class="lesson-prompt">${escapeHtml(question.question)}</h3><div class="practice-options quiz-options">${order.map((index) => `<button class="practice-option" data-lesson-answer="${index}" ${lessonSession.answered ? 'disabled' : ''}>${escapeHtml(question.options[index])}</button>`).join('')}</div>${feedback}</div>`;
+    stage.innerHTML = `<div class="lesson-scroll"><div class="quiz-progress"><span>ВОПРОС ${questionIndex + 1} ИЗ ${lesson.quiz.length}</span><span>${lessonSession.correct} верно · порог ${quizPassMark}%</span></div><h3 class="lesson-prompt">${escapeHtml(question.question)}</h3><div class="practice-options quiz-options">${order.map((index) => `<button class="practice-option" data-lesson-answer="${index}" ${lessonSession.answered ? 'disabled' : ''}>${escapeHtml(question.options[index])}</button>`).join('')}</div>${feedback}</div>`;
     return;
   }
 
-  const { result } = lessonSession;
-  const recommendation = result.percent >= 80 ? 'Отличный результат. Переходи дальше и возвращайся к уроку для повторения.' : result.passed ? 'Хорошая работа. Перед следующим уроком повтори вопросы, в которых ошибся.' : 'Повтори теорию и практическую схему, затем попробуй тест ещё раз. Для завершения нужно не менее 60%.';
-  stage.innerHTML = `<div class="lesson-result ${result.passed ? 'passed' : 'retry'}"><div class="result-medal">${result.passed ? '✦' : '↻'}</div><span class="eyebrow">${result.passed ? 'УРОК ЗАВЕРШЁН' : 'НУЖНА ЕЩЁ ОДНА ПОПЫТКА'}</span><h3>${result.passed ? 'Отличный полёт!' : 'Продолжай тренировку'}</h3><div class="result-score"><strong>${result.correct}</strong><span>из ${lesson.quiz.length} правильных</span><b>${result.percent}%</b></div><p>${escapeHtml(recommendation)}</p><div class="result-rewards">${result.lessonReward ? '<span>Урок завершён · +100 XP</span>' : '<span>Награда за завершение уже получена</span>'}<span>Верные ответы · XP начисляются один раз</span></div><div class="result-actions">${result.passed ? '<button class="button-secondary" data-close-lesson>К списку уроков</button>' : '<button class="button-secondary" data-retry-quiz>Повторить тест</button><button class="button-secondary" data-close-lesson>Закрыть</button>'}</div></div>`;
+  if (step === 'practice') {
+    if (lesson.practice.mode === 'cockpit') {
+      stage.innerHTML = `<div class="lesson-scroll"><span class="pill-blue">3D-ТРЕНАЖЁР · ПРИБОРНАЯ ПАНЕЛЬ</span><h3 class="lesson-prompt">Найди приборы, указанные в задании.</h3><div class="cockpit-practice-host" id="cockpit-practice-host"></div><p class="lesson-safety-note">Это учебная схема для распознавания приборов, не модель кабины конкретного борта.</p></div>`;
+      const host = stage.querySelector('#cockpit-practice-host');
+      const session = lessonSession;
+      initializeCockpitPractice(host, {
+        tasks: lesson.practice.tasks,
+        completedTasks: lessonSession.completedPracticeTasks,
+        initialMistakes: lessonSession.practiceErrors,
+        onProgress: ({ completedTasks, mistakes }) => {
+          if (lessonSession !== session) return;
+          lessonSession.completedPracticeTasks = completedTasks;
+          lessonSession.practiceErrors = mistakes;
+          persistLessonProgress('practice', { completedPracticeTasks: completedTasks, practiceErrors: mistakes });
+        },
+        onMistake: ({ mistakes }) => {
+          if (lessonSession !== session) return;
+          lessonSession.practiceErrors = mistakes;
+          persistLessonProgress('practice', { practiceErrors: mistakes });
+        },
+        onComplete: ({ completedTasks, mistakes }) => { if (lessonSession === session) completePractice({ completedTasks, mistakes }); },
+      }).then((controller) => {
+        if (lessonSession !== session || lessonSession?.step !== 'practice') controller?.dispose?.();
+        else lessonPracticeController = controller;
+      });
+      return;
+    }
+    const practice = lesson.practice;
+    const practiceFeedback = lessonSession.practiceChoice === undefined ? '' : `<div class="answer-explanation ${lessonSession.practiceCorrect ? 'is-correct' : 'is-wrong'}"><b>${lessonSession.practiceCorrect ? 'Верно. Практика выполнена.' : `Неверно. Правильный вариант: ${escapeHtml(practice.options[practice.answer])}`}</b><p>${escapeHtml(practice.explanation)}</p></div>`;
+    stage.innerHTML = `<div class="lesson-scroll"><span class="pill-blue">ПРАКТИЧЕСКОЕ ЗАДАНИЕ</span><h3 class="lesson-prompt">${escapeHtml(practice.prompt)}</h3><div class="practice-options">${lessonSession.practiceOrder.map((index) => `<button class="practice-option ${lessonSession.practiceChoice === index ? (lessonSession.practiceCorrect ? 'selected-correct' : 'selected-wrong') : ''}" data-practice-answer="${index}" ${lessonSession.practiceCorrect ? 'disabled' : ''}>${escapeHtml(practice.options[index])}</button>`).join('')}</div>${practiceFeedback}<button class="button-primary lesson-next" data-practice-check ${lessonSession.practiceChoice === undefined || lessonSession.practiceCorrect ? 'disabled' : ''}>Проверить задание</button></div>`;
+    return;
+  }
+
+  const result = lessonSession.result;
+  const recommendations = result.errors ? `Ошибок: ${result.errors}. ${result.errors > 1 ? 'Повтори теорию и внимательно изучи подписи на схеме.' : 'Повтори тему и обрати внимание на объяснение к ответу.'}` : 'Все этапы выполнены без ошибок. Можно переходить к следующему уроку.';
+  stage.innerHTML = `<div class="lesson-result passed"><div class="result-medal">✦</div><span class="eyebrow">УРОК УСПЕШНО ЗАВЕРШЁН</span><h3>${escapeHtml(lesson.title)}</h3><div class="result-score"><strong>${result.quizCorrect}</strong><span>из ${lesson.quiz.length} в тесте</span><b>${result.quizPercent}%</b></div><p>${escapeHtml(recommendations)}</p><div class="result-rewards"><span>${result.rewardClaimedNow ? 'Награда за урок · +100 XP' : 'Награда за урок уже была получена'}</span><span>Верные ответы теста · XP сохраняются по каждому вопросу</span></div><div class="result-actions"><button class="button-secondary" data-close-lesson>К списку уроков</button></div></div>`;
 }
 
-function finishLesson() {
+function completeTheory() {
+  if (!lessonSession || lessonSession.step !== 'theory') return;
+  const saved = getLessonProgress(lessonSession.lesson.id);
+  if (!saved) return;
+  markTheoryComplete(profile(), lessonSession.lesson.id);
+  if (!lessonSession.replay) {
+    const attempt = saved.quizAttempt;
+    lessonSession.questionIndex = attempt.questionIndex;
+    lessonSession.correct = attempt.correct;
+    lessonSession.answered = attempt.answered;
+    lessonSession.lastCorrect = attempt.lastCorrect;
+    lessonSession.errors = attempt.errors;
+    lessonSession.quizOutcome = saved.quizOutcome || '';
+  }
+  saveState();
+  refreshDashboard();
+  lessonSession.step = 'quiz';
+  renderLessonStep();
+}
+
+function saveQuizAttempt() {
+  if (lessonSession.replay) return;
+  const saved = getLessonProgress(lessonSession.lesson.id);
+  saved.quizAttempt = { questionIndex: lessonSession.questionIndex, correct: lessonSession.correct, answered: lessonSession.answered, lastCorrect: lessonSession.lastCorrect, errors: lessonSession.errors };
+  saveState();
+}
+
+function completeQuiz() {
   const current = profile();
   const lesson = lessonSession.lesson;
-  const correct = lessonSession.correct;
-  const percent = Math.round(correct / lesson.quiz.length * 100);
-  const passed = percent >= 60;
-  const previousBest = current.testResults[lesson.title] || 0;
-  current.testResults[lesson.title] = Math.max(previousBest, percent);
-  let lessonReward = false;
-  if (passed && !current.completedLessons.includes(lesson.id)) {
-    lessonReward = awardXp(100, `Урок «${lesson.title}» завершён`, lesson.id, 'completedLessons');
-  } else {
-    if (current.completedLessons.length >= 3) addAchievement('three-lessons');
-    saveState();
-    refreshDashboard();
-    renderProfile();
-  }
-  lessonSession.step = 'result';
-  lessonSession.result = { correct, percent, passed, lessonReward };
+  const percent = Math.round(lessonSession.correct / lesson.quiz.length * 100);
+  const passed = recordQuiz(current, lesson.id, lesson.title, percent, quizPassMark, { replay: lessonSession.replay });
+  lessonSession.quizPercent = percent;
+  lessonSession.quizCorrect = lessonSession.correct;
+  lessonSession.quizOutcome = passed ? 'passed' : 'failed';
+  const saved = getLessonProgress(lesson.id);
+  saved.lastQuizScore = percent;
+  saved.lastQuizCorrect = lessonSession.correct;
+  saved.quizOutcome = passed ? 'passed' : 'failed';
+  if (saved.status !== 'completed') saved.status = 'quiz';
+  if (!lessonSession.replay) saved.quizPassed = passed;
+  saveQuizAttempt();
+  saveState();
+  refreshDashboard();
+  renderProfile();
   renderLessonStep();
+}
+
+function completePractice({ completedTasks = [], mistakes = 0 } = {}) {
+  if (!lessonSession || lessonSession.step !== 'practice') return;
+  const current = profile();
+  if (!current) return;
+  const saved = getLessonProgress(lessonSession.lesson.id);
+  const requiredTasks = lessonSession.lesson.practice.mode === 'cockpit' ? lessonSession.lesson.practice.tasks.map((task) => task.id) : [];
+  const completed = markPracticeComplete(current, lessonSession.lesson.id, {
+    isCorrect: lessonSession.practiceCorrect, requiredTasks, completedTasks, replay: lessonSession.replay, mistakes: mistakes || lessonSession.practiceErrors || 0,
+  });
+  if (!saved?.theoryViewed || !completed) return;
+  lessonSession.practiceCompleted = true;
+  lessonSession.practiceErrors = mistakes || lessonSession.practiceErrors || 0;
+  saveState();
+  completeLesson();
+}
+
+function completeLesson() {
+  if (!lessonSession || lessonSession.step !== 'practice') return false;
+  const current = profile();
+  const saved = getLessonProgress(lessonSession.lesson.id);
+  if (!current || !canCompleteLesson(current, lessonSession.lesson.id)) return false;
+  const outcome = markLessonComplete(current, lessonSession.lesson.id);
+  const rewardClaimedNow = outcome.awarded;
+  addAchievement('first-lesson');
+  if (current.completedLessons.length >= lessons.length) addAchievement('graduate');
+  saveState();
+  refreshDashboard();
+  renderProfile();
+  lessonSession.result = {
+    quizCorrect: lessonSession.quizCorrect ?? saved.lastQuizCorrect ?? lessonSession.correct,
+    quizPercent: lessonSession.quizPercent ?? saved.lastQuizScore ?? 100,
+    errors: lessonSession.errors + lessonSession.practiceErrors,
+    rewardClaimedNow,
+  };
+  lessonSession.step = 'result';
+  renderLessonStep();
+  instructor?.lessonComplete(lessonSession.lesson);
+  if (rewardClaimedNow) toast('Урок успешно завершён: +100 XP');
+  return true;
+}
+
+function missionRecord(id) {
+  const current = profile();
+  if (!current) return null;
+  current.missionProgress ||= {};
+  current.missionProgress[id] ||= { status: 'available', attempts: 0, bestScore: null, rewardClaimed: current.completedMissions.includes(id) };
+  return current.missionProgress[id];
+}
+
+function persistMissionAttempt() {
+  if (!missionSession) return;
+  const record = missionRecord(missionSession.mission.id);
+  if (!record) return;
+  record.attempt = { questionIndex: missionSession.questionIndex, correct: missionSession.correct, errors: missionSession.errors, answered: missionSession.answered, selected: missionSession.selected, score: missionSession.score, errorNotes: missionSession.errorNotes || [] };
+  if (!profile().completedMissions.includes(missionSession.mission.id)) record.status = 'in_progress';
+  saveState();
+  refreshDashboard();
+}
+
+function startMission(mission) {
+  if (!mission) return;
+  const current = profile();
+  if (!current) {
+    toast('Войди в профиль, чтобы сохранять результаты миссий и награды.');
+    navigate('profile');
+    return;
+  }
+  const record = missionRecord(mission.id);
+  record.results ||= [];
+  const savedAttempt = record.attempt;
+  const resume = savedAttempt && !current.completedMissions.includes(mission.id);
+  if (!resume) record.attempts = (record.attempts || 0) + 1;
+  const attempt = resume ? savedAttempt : { questionIndex: 0, correct: 0, errors: 0, answered: false, selected: null, score: 0, errorNotes: [] };
+  missionSession = { mission, ...attempt, phase: 'active' };
+  missionSession.errorNotes ||= [];
+  if (!current.completedMissions.includes(mission.id)) record.status = 'in_progress';
+  persistMissionAttempt();
+  instructor?.missionStart(mission);
+  if (mission.kind === 'instrument') {
+    document.querySelector('#mission-dialog').close();
+    navigate('simulator');
+    toast('Найди прибор, указанный Алексом, на панели 3D-кабины.');
+    return;
+  }
+  renderMissionStage();
+  const dialog = document.querySelector('#mission-dialog');
+  if (!dialog.open) dialog.showModal();
+}
+
+function renderMissionStage() {
+  if (!missionSession) return;
+  const { mission } = missionSession;
+  const stage = document.querySelector('#mission-dialog-stage');
+  document.querySelector('#mission-dialog-title').textContent = mission.title;
+  if (missionSession.phase === 'result') {
+    const result = missionSession.result;
+    stage.innerHTML = `<div class="mission-result ${result.passed ? 'passed' : 'failed'}"><span class="result-medal">${result.passed ? '✓' : '↻'}</span><span class="eyebrow">${result.passed ? 'МИССИЯ ВЫПОЛНЕНА' : 'ПОПРОБУЙ ЕЩЁ РАЗ'}</span><h3>${mission.title}</h3><div class="mission-result-stats"><span><b>${result.score}</b> очков</span><span><b>${result.percent}%</b> верных</span><span><b>+${result.xpEarned}</b> XP</span><span><b>${result.errors}</b> ошибок</span></div><p>${result.recommendation}</p><div class="result-actions"><button class="button-primary" data-mission-retry>Повторить миссию</button><button class="button-secondary" data-mission-menu>Вернуться к миссиям</button></div></div>`;
+    document.querySelector('#mission-dialog-count').textContent = 'РЕЗУЛЬТАТ';
+    return;
+  }
+  if (mission.displayReading) {
+    stage.dataset.reading = 'true';
+  } else delete stage.dataset.reading;
+  const index = missionSession.questionIndex;
+  const question = mission.questions[index];
+  document.querySelector('#mission-dialog-count').textContent = `${index + 1} / ${mission.questions.length}`;
+  const feedback = missionSession.answered ? `<div class="answer-explanation ${missionSession.selected === question.answer ? 'is-correct' : 'is-wrong'}"><b>${missionSession.selected === question.answer ? 'Верно!' : `Неверно. Правильный ответ: ${question.options[question.answer]}`}</b><p>${question.explanation}</p></div><button class="button-primary lesson-next" data-mission-next>${index < mission.questions.length - 1 ? 'Следующий вопрос' : 'Завершить проверку'} <span>→</span></button>` : '';
+  stage.innerHTML = `${mission.displayReading ? `<div class="mission-reading-display"><small>ПОКАЗАНИЕ УЧЕБНОГО ВЫСОТОМЕРА</small><b>${mission.displayReading}</b><span>ALT · высота</span></div>` : ''}<div class="quiz-progress"><span>ВОПРОС ${index + 1} ИЗ ${mission.questions.length}</span><span>${missionSession.correct} верно · нужно ${mission.passCount}</span></div><h3 class="lesson-prompt">${question.prompt}</h3><div class="practice-options quiz-options">${question.options.map((option, optionIndex) => `<button class="practice-option ${missionSession.answered && missionSession.selected === optionIndex ? (optionIndex === question.answer ? 'selected-correct' : 'selected-wrong') : ''}" data-mission-answer="${optionIndex}" ${missionSession.answered ? 'disabled' : ''}>${option}</button>`).join('')}</div>${feedback}`;
+}
+
+function finishMission(passed) {
+  if (!missionSession || missionSession.phase !== 'active') return;
+  const current = profile();
+  const { mission } = missionSession;
+  const correctCount = missionSession.correct;
+  const total = mission.questions?.length || 1;
+  const percent = Math.round(correctCount / total * 100);
+  const score = Math.max(0, correctCount * 100 - missionSession.errors * 20);
+  const record = missionRecord(mission.id);
+  const alreadyRewarded = current.completedMissions.includes(mission.id);
+  let xpEarned = 0;
+  if (passed && !alreadyRewarded) {
+    current.completedMissions.push(mission.id);
+    current.xp += mission.rewardXp;
+    xpEarned = mission.rewardXp;
+    record.rewardClaimed = true;
+    record.rewardXpEarned = mission.rewardXp;
+    record.completedAt = new Date().toISOString();
+  }
+  if (passed) record.status = 'completed';
+  else if (!alreadyRewarded) record.status = 'in_progress';
+  record.attempt = null;
+  record.lastScore = score;
+  record.lastPercent = percent;
+  record.lastErrors = missionSession.errors;
+  record.bestScore = record.bestScore == null ? score : Math.max(record.bestScore, score);
+  const recommendation = passed
+    ? missionSession.errors ? `Миссия пройдена. Разбери ошибки: ${(missionSession.errorNotes || []).join(' ')}` : 'Отличный результат. Продолжай изучать приборы и проверяй свои ответы.'
+    : `Нужно выполнить условие: ${mission.condition.toLowerCase()}. ${(missionSession.errorNotes || []).at(-1) || 'Сравни варианты и попробуй ещё раз.'}`;
+  record.lastResult = { passed, score, percent, errors: missionSession.errors, xpEarned, recommendation, completedAt: new Date().toISOString() };
+  record.results ||= [];
+  record.results.push({ attempt: record.attempts, passed, score, percent, errors: missionSession.errors, xpEarned, recommendation, completedAt: record.lastResult.completedAt });
+  if (record.results.length > 50) record.results.splice(0, record.results.length - 50);
+  if (mission.questions) current.testResults[mission.title] = Math.max(current.testResults[mission.title] || 0, percent);
+  missionSession.phase = 'result';
+  missionSession.result = { passed, score, percent, errors: missionSession.errors, xpEarned, recommendation };
+  if (mission.id === 'find-airspeed' && passed) addAchievement('instrument-expert');
+  if (mission.id === 'flight-exam' && passed && percent >= 80) addAchievement('theorist');
+  if (passed && missionSession.errors === 0) addAchievement('careful-pilot');
+  saveState();
+  refreshDashboard();
+  renderProfile();
+  instructor?.missionResult(mission, missionSession.result);
+  if (window.aeroSimulator) window.aeroSimulator.setPaused(true);
+  renderMissionStage();
+  const dialog = document.querySelector('#mission-dialog');
+  if (!dialog.open) dialog.showModal();
+  if (xpEarned) toast(`Миссия выполнена: +${xpEarned} XP`);
+}
+
+function onSimulatorInstrument(instrument) {
+  instructor?.instrument(instrument);
+  if (!missionSession || missionSession.phase !== 'active' || missionSession.mission.kind !== 'instrument') return;
+  if (instrument.id === missionSession.mission.targetInstrument) {
+    missionSession.correct = 1;
+    missionSession.score = 100;
+    finishMission(true);
+    return;
+  }
+  missionSession.errors += 1;
+  missionSession.errorNotes ||= [];
+  missionSession.errorNotes.push(`Это ${instrument.title}; найди указатель воздушной скорости с маркировкой ASI.`);
+  missionSession.score = Math.max(0, 100 - missionSession.errors * 20);
+  persistMissionAttempt();
+  instructor?.mistake(`Это ${instrument.title}. В этой миссии нужно найти указатель воздушной скорости (ASI).`);
 }
 
 function showAuthTab(tab) {
@@ -289,6 +585,7 @@ document.querySelector('#register-form').addEventListener('submit', async (event
     saveState();
     form.reset();
     refreshDashboard(); renderProfile();
+    instructor?.welcome(nickname);
     toast('Профиль курсанта создан');
   } catch (error) { message.textContent = error.message || 'Не получилось создать профиль. Попробуй ещё раз.'; }
 });
@@ -311,11 +608,13 @@ document.querySelector('#login-form').addEventListener('submit', async (event) =
     saveState();
     form.reset();
     refreshDashboard(); renderProfile();
+    instructor?.welcome(user.nickname);
     toast(`С возвращением, ${user.nickname}!`);
   } catch (error) { message.textContent = error.message || 'Не удалось выполнить вход.'; }
 });
 
 document.addEventListener('click', (event) => {
+  if (event.target.closest('[data-instructor-help]')) instructor?.help();
   const navButton = event.target.closest('[data-page]');
   if (navButton) navigate(navButton.dataset.page);
   if (event.target.closest('#theme-toggle')) applyTheme(state.theme === 'dark' ? 'light' : 'dark');
@@ -324,14 +623,58 @@ document.addEventListener('click', (event) => {
   if (event.target.closest('[data-action="start-lesson"]')) navigate('learning');
   const tab = event.target.closest('[data-auth-tab]');
   if (tab) showAuthTab(tab.dataset.authTab);
-  if (event.target.closest('#logout-button')) { state.sessionEmail = ''; saveState(); renderProfile(); refreshDashboard(); toast('Ты вышел из профиля'); }
+  if (event.target.closest('#logout-button')) { state.sessionEmail = ''; missionSession = null; saveState(); renderProfile(); refreshDashboard(); toast('Ты вышел из профиля'); }
   if (event.target.closest('#reset-progress-button')) {
     if (!confirm('Сбросить XP, уроки, миссии, результаты тестов и достижения? Это действие нельзя отменить.')) return;
     const currentUser = users.find((user) => user.email === state.sessionEmail);
     if (!currentUser) { toast('Не удалось найти учётную запись для этого профиля'); return; }
+    missionSession = null;
+    if (document.querySelector('#mission-dialog').open) document.querySelector('#mission-dialog').close();
     state.profiles[state.sessionEmail] = blankProfile(currentUser);
     saveState(); refreshDashboard(); renderProfile(); toast('Игровой прогресс сброшен');
   }
+  const missionAnswer = event.target.closest('[data-mission-answer]');
+  if (missionAnswer && missionSession?.phase === 'active' && !missionSession.answered) {
+    const question = missionSession.mission.questions[missionSession.questionIndex];
+    missionSession.selected = Number(missionAnswer.dataset.missionAnswer);
+    missionSession.answered = true;
+    if (missionSession.selected === question.answer) {
+      missionSession.correct += 1;
+      instructor?.correct(question.explanation);
+    } else {
+      missionSession.errors += 1;
+      missionSession.errorNotes ||= [];
+      missionSession.errorNotes.push(question.explanation);
+      instructor?.mistake(question.explanation);
+    }
+    missionSession.score = Math.max(0, missionSession.correct * 100 - missionSession.errors * 20);
+    persistMissionAttempt();
+    renderMissionStage();
+    return;
+  }
+  if (event.target.closest('[data-mission-next]') && missionSession?.phase === 'active') {
+    if (missionSession.questionIndex < missionSession.mission.questions.length - 1) {
+      missionSession.questionIndex += 1;
+      missionSession.answered = false;
+      missionSession.selected = null;
+      persistMissionAttempt();
+      renderMissionStage();
+    } else finishMission(missionSession.correct >= missionSession.mission.passCount);
+    return;
+  }
+  if (event.target.closest('[data-mission-retry]') && missionSession) {
+    const { mission } = missionSession;
+    document.querySelector('#mission-dialog').close();
+    startMission(mission);
+    return;
+  }
+  if (event.target.closest('[data-mission-menu]')) {
+    document.querySelector('#mission-dialog').close();
+    missionSession = null;
+    navigate('missions');
+    return;
+  }
+  if (event.target.closest('[data-mission-close]')) document.querySelector('#mission-dialog').close();
   const answer = event.target.closest('[data-answer]');
   if (answer) {
     const current = profile();
@@ -349,17 +692,51 @@ document.addEventListener('click', (event) => {
   if (practiceAnswer && lessonSession?.step === 'practice') {
     const selected = Number(practiceAnswer.dataset.practiceAnswer);
     lessonSession.practiceChoice = selected;
-    lessonSession.practiceCorrect = selected === lessonSession.lesson.practice.answer;
     renderLessonStep();
   }
-  if (event.target.closest('[data-lesson-next="practice"]') && lessonSession) {
+  if (event.target.closest('[data-complete-theory]') && lessonSession?.step === 'theory') completeTheory();
+  if (event.target.closest('[data-quiz-continue]') && lessonSession?.step === 'quiz' && getLessonProgress(lessonSession.lesson.id)?.quizPassed) {
+    if (!enterPractice(profile(), lessonSession.lesson.id, { replay: lessonSession.replay })) return;
+    persistLessonProgress('practice');
     lessonSession.step = 'practice';
+    lessonSession.practiceChoice = undefined;
+    lessonSession.practiceCorrect = false;
     renderLessonStep();
   }
-  if (event.target.closest('[data-lesson-next="quiz"]') && lessonSession?.practiceCorrect) {
-    lessonSession.step = 'quiz';
+  if (event.target.closest('[data-practice-check]') && lessonSession?.step === 'practice' && lessonSession.practiceChoice !== undefined) {
+    const practice = lessonSession.lesson.practice;
+    lessonSession.practiceCorrect = lessonSession.practiceChoice === practice.answer;
+    if (lessonSession.practiceCorrect) {
+      instructor?.correct(practice.explanation);
+      completePractice();
+    } else {
+      lessonSession.practiceErrors += 1;
+      instructor?.mistake(practice.explanation);
+      persistLessonProgress('practice', { practiceErrors: lessonSession.practiceErrors });
+      renderLessonStep();
+    }
+  }
+  if (event.target.closest('[data-retry-quiz]') && lessonSession?.step === 'quiz') {
+    lessonSession.quizOutcome = '';
     lessonSession.questionIndex = 0;
+    lessonSession.correct = 0;
+    lessonSession.answered = false;
+    lessonSession.lastCorrect = false;
+    lessonSession.errors = 0;
+    const saved = getLessonProgress(lessonSession.lesson.id);
+    saved.quizOutcome = '';
+    saveQuizAttempt();
+    saveState();
     renderLessonStep();
+  }
+  if (event.target.closest('[data-quiz-next]') && lessonSession?.step === 'quiz') {
+    if (lessonSession.questionIndex < lessonSession.lesson.quiz.length - 1) {
+      lessonSession.questionIndex += 1;
+      lessonSession.answered = false;
+      lessonSession.lastCorrect = false;
+      saveQuizAttempt();
+      renderLessonStep();
+    } else completeQuiz();
   }
   const lessonAnswer = event.target.closest('[data-lesson-answer]');
   if (lessonAnswer && lessonSession?.step === 'quiz' && !lessonSession.answered) {
@@ -368,29 +745,14 @@ document.addEventListener('click', (event) => {
     lessonSession.answered = true;
     if (lessonSession.lastCorrect) {
       lessonSession.correct += 1;
+      instructor?.correct(question.explanation);
       awardXp(20, 'Верный ответ', `lesson-question:${lessonSession.lesson.id}:${lessonSession.questionIndex}`, 'completedTests');
-    }
+    } else { lessonSession.errors += 1; instructor?.mistake(question.explanation); }
+    saveQuizAttempt();
     renderLessonStep();
-  }
-  if (event.target.closest('[data-quiz-next]') && lessonSession?.step === 'quiz') {
-    if (lessonSession.questionIndex < lessonSession.lesson.quiz.length - 1) {
-      lessonSession.questionIndex += 1;
-      lessonSession.answered = false;
-      lessonSession.lastCorrect = false;
-      renderLessonStep();
-    } else finishLesson();
-  }
-  if (event.target.closest('[data-retry-quiz]') && lessonSession) {
-    lessonSession.step = 'quiz'; lessonSession.questionIndex = 0; lessonSession.correct = 0; lessonSession.answered = false; lessonSession.lastCorrect = false; renderLessonStep();
   }
   if (event.target.closest('[data-close-lesson]')) document.querySelector('#lesson-dialog').close();
   if (event.target.closest('#lesson-close')) document.querySelector('#lesson-dialog').close();
-  if (event.target.closest('#complete-mission')) {
-    awardXp(50, 'Дополнительное задание выполнено', 'preflight-check', 'completedMissions');
-    const button = document.querySelector('#complete-mission');
-    if (profile()?.completedMissions.includes('preflight-check')) button.disabled = true;
-    button.textContent = button.disabled ? 'Задание выполнено ✓' : 'Отметить выполнение · +50 XP';
-  }
 });
 
 document.querySelector('#menu-toggle').addEventListener('click', () => document.querySelector('#sidebar').classList.toggle('open'));
@@ -398,13 +760,15 @@ document.addEventListener('keydown', (event) => { if (event.key === 'Escape') do
 
 renderLessons(document.querySelector('#course-grid'), { onStart: startLesson });
 renderLessons(document.querySelector('#all-course-grid'), { onStart: startLesson });
-document.querySelector('#complete-mission').addEventListener('click', (event) => {
-  const current = profile();
-  if (current?.completedMissions.includes('preflight-check')) { event.currentTarget.disabled = true; event.currentTarget.textContent = 'Задание выполнено ✓'; }
-});
 document.querySelector('#lesson-dialog').addEventListener('click', (event) => { if (event.target === event.currentTarget) event.currentTarget.close(); });
+document.querySelector('#lesson-dialog').addEventListener('close', () => {
+  lessonPracticeController?.dispose?.();
+  lessonPracticeController = null;
+  lessonSession = null;
+});
 applyTheme(state.theme);
 renderProfile();
 refreshDashboard();
+instructor?.welcome(profile()?.nickname || '');
 const initialPage = location.hash.slice(1);
 if (pageTitles[initialPage]) navigate(initialPage);

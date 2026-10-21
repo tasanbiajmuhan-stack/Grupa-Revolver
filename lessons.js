@@ -1,3 +1,5 @@
+import { lessonStatus } from './lesson-engine.mjs';
+
 // Introductory study material; aircraft layouts vary by type. Training content
 // is conceptual and is not a checklist or substitute for instructor guidance.
 export const lessons = [
@@ -13,7 +15,10 @@ export const lessons = [
       { icon: '⚙', title: 'Системы', text: 'Двигатель и бортовое оборудование' },
       { icon: '✈', title: 'Управление', text: 'Штурвал, педали и рычаги' },
     ],
-    practice: { prompt: 'На схеме горит предупреждение о низком давлении масла. Где в первую очередь искать информацию?', options: ['На приборе или индикаторе двигателя', 'На авиагоризонте', 'На указателе курса'], answer: 0, explanation: 'Параметры двигателя, включая давление масла, относятся к контролю силовой установки. Точное расположение индикатора смотри в руководстве конкретного самолёта.' },
+    practice: { mode: 'cockpit', tasks: [
+      { id: 'airspeed', label: 'Указатель воздушной скорости', prompt: 'Найди указатель воздушной скорости на панели.' },
+      { id: 'altimeter', label: 'Высотомер', prompt: 'Теперь найди высотомер.' },
+    ] },
     quiz: [
       { question: 'Для чего нужна приборная панель?', options: ['Чтобы показывать состояние полёта и систем самолёта', 'Чтобы управлять погодой', 'Только для отображения карты'], answer: 0, explanation: 'Приборы сообщают пилоту о параметрах полёта и работе систем.' },
       { question: 'Где находятся основные органы управления?', options: ['В кабине пилота', 'В багажном отсеке', 'На крыле'], answer: 0, explanation: 'Пилот управляет самолётом из кабины; органы управления связаны с управляющими поверхностями и системами самолёта.' },
@@ -117,18 +122,20 @@ export const lessons = [
   },
 ];
 
-export function renderLessons(container, { onStart, completedIds = [] } = {}) {
+export function renderLessons(container, { onStart, completedIds = [], progressMap = {} } = {}) {
   if (!container) return;
   container.innerHTML = lessons.map((lesson, index) => {
-    const completed = completedIds.includes(lesson.id);
-    const locked = index > 0 && !completedIds.includes(lessons[index - 1].id);
-    const label = completed ? 'Завершён ✓' : locked ? `Закрыт · урок ${index}` : 'Доступен';
+    const status = lessonStatus(lessons, { completedLessons: completedIds, lessonProgress: progressMap }, lesson.id);
+    const completed = status === 'completed';
+    const locked = status === 'locked';
+    const progress = progressMap[lesson.id] || {};
+    const label = completed ? 'Завершён ✓' : locked ? `Закрыт · урок ${index}` : progress.status === 'practice' ? 'Продолжить · практика' : progress.status === 'quiz' ? 'Продолжить · тест' : progress.status === 'theory' ? 'Продолжить · теория' : 'Доступен';
     return `<article class="course-card lesson-card ${completed ? 'is-complete' : ''} ${locked ? 'is-locked' : ''}" data-lesson="${lesson.id}">
       <div class="course-top"><span class="course-icon ${lesson.tone}">${lesson.icon}</span><span class="course-status">${label}</span></div>
       <h3>${index + 1}. ${lesson.title}</h3><p>${lesson.description}</p>
       <div class="course-bottom"><span>${lesson.quiz.length} вопроса · около 8 мин</span><b>+100 XP</b></div>
-      <div class="course-progress"><i style="width:${completed ? 100 : locked ? 0 : 12}%"></i></div>
-      <button class="lesson-start-button" data-lesson-start="${lesson.id}" ${locked ? 'disabled title="Заверши предыдущий урок, чтобы открыть этот"' : ''}>${locked ? 'Сначала предыдущий урок' : completed ? 'Повторить урок' : 'Начать урок'} <span>${locked ? '🔒' : '→'}</span></button>
+      <div class="course-progress"><i style="width:${completed ? 100 : locked ? 0 : progress.status === 'practice' ? 70 : progress.status === 'quiz' ? 40 : progress.status === 'theory' ? 15 : 0}%"></i></div>
+      <button class="lesson-start-button" data-lesson-start="${lesson.id}" ${locked ? 'disabled title="Заверши предыдущий урок, чтобы открыть этот"' : ''}>${locked ? 'Сначала предыдущий урок' : completed ? 'Повторить урок' : progress.status ? 'Продолжить урок' : 'Начать урок'} <span>${locked ? '🔒' : '→'}</span></button>
     </article>`;
   }).join('');
   container.querySelectorAll('[data-lesson-start]').forEach((button) => {
