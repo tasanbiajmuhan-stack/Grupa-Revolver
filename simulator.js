@@ -18,7 +18,7 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
   let disposed = false;
   let active = true;
   let paused = false;
-  let renderer, scene, camera, resizeObserver, animationId, lastFrame = 0;
+  let renderer, scene, camera, resizeObserver, animationId, animationRunning = false, lastFrame = 0;
   let cameraYaw = 0, cameraPitch = 0.03, cameraDistance = 9.3;
   let dragPointer = null;
   let hovered = null;
@@ -28,6 +28,7 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
   const defaultFlight = { ...flight };
   let yoke;
   let horizonGroup;
+  let cameraTarget;
   let gaugeNeedles = new Map();
 
   const setState = (label, kind = '') => { status.textContent = label; status.dataset.state = kind; };
@@ -48,7 +49,8 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
     if (notify) onInstrumentSelect({ ...instrument, reading: instrument.get(flight) });
   };
   const updateCamera = (THREE) => {
-    const target = new THREE.Vector3(0, 0.82, -2.05);
+    cameraTarget ||= new THREE.Vector3(0, 0.82, -2.05);
+    const target = cameraTarget;
     const cp = Math.cos(cameraPitch);
     camera.position.set(target.x + cameraDistance * Math.sin(cameraYaw) * cp, target.y + cameraDistance * Math.sin(cameraPitch), target.z + cameraDistance * Math.cos(cameraYaw) * cp);
     camera.lookAt(target);
@@ -153,7 +155,7 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
     const wheelZoom = (event) => { event.preventDefault(); cameraDistance = Math.max(7.1, Math.min(12.2, cameraDistance + event.deltaY * .006)); updateCamera(THREE); };
     renderer.domElement.addEventListener('pointermove', pointerMove); renderer.domElement.addEventListener('pointerdown', pointerDown); renderer.domElement.addEventListener('pointerup', pointerUp); renderer.domElement.addEventListener('pointercancel', pointerUp); renderer.domElement.addEventListener('wheel', wheelZoom, { passive: false });
     const keyDown = (event) => {
-      if (!active || event.target.matches('input,textarea,select')) return;
+      if (!active || event.target.matches?.('input,textarea,select,[contenteditable="true"]')) return;
       const key = event.key.toLowerCase();
       if (['w', 'a', 's', 'd', 'q', 'e', ' '].includes(key)) event.preventDefault();
       if (key === 'escape') { onExit(); return; }
@@ -162,21 +164,36 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
     };
     const keyUp = (event) => held.delete(event.key.toLowerCase());
     window.addEventListener('keydown', keyDown); window.addEventListener('keyup', keyUp);
-    const updateReadouts = () => {
+    const readoutElements = {
+      pitch: root.querySelector('#sim-pitch-value'), bank: root.querySelector('#sim-bank-value'),
+      heading: root.querySelector('#sim-heading-value'), speed: root.querySelector('#sim-speed-value'),
+      altitude: root.querySelector('#sim-altitude-value'), info: root.querySelector('#sim-info-reading'),
+      infoTitle: root.querySelector('#sim-info-title'),
+    };
+    let lastReadoutUpdate = 0;
+    const updateReadouts = (time) => {
+      if (time - lastReadoutUpdate >= 100) {
+        lastReadoutUpdate = time;
+        readoutElements.pitch.textContent = `${Math.round(flight.pitch)}°`;
+        readoutElements.bank.textContent = `${Math.round(flight.bank)}°`;
+        readoutElements.heading.textContent = `${String(Math.round(flight.heading + 360) % 360).padStart(3, '0')}°`;
+        readoutElements.speed.textContent = `${Math.round(flight.speed)} kt`;
+        readoutElements.altitude.textContent = `${Math.round(flight.altitude)} ft`;
+        const selected = instruments.find((item) => item.title === readoutElements.infoTitle.textContent);
+        if (selected) readoutElements.info.textContent = selected.get(flight);
+      }
       root.querySelector('#sim-pitch-value').textContent = `${Math.round(flight.pitch)}°`;
       root.querySelector('#sim-bank-value').textContent = `${Math.round(flight.bank)}°`;
       root.querySelector('#sim-heading-value').textContent = `${String(Math.round(flight.heading + 360) % 360).padStart(3, '0')}°`;
       root.querySelector('#sim-speed-value').textContent = `${Math.round(flight.speed)} kt`;
       root.querySelector('#sim-altitude-value').textContent = `${Math.round(flight.altitude)} ft`;
       for (const item of instruments.slice(0, 6)) { const { needle } = meshes.get(item.id); if (item.id === 'airspeed') needle.rotation.z = (flight.speed - 95) * .018; else if (item.id === 'attitude') { needle.rotation.z = -flight.bank * Math.PI / 180; needle.position.y = flight.pitch * .008; } else if (item.id === 'altimeter') needle.rotation.z = -(flight.altitude % 10000) / 10000 * Math.PI * 2; else if (item.id === 'vertical-speed') needle.rotation.z = -flight.verticalSpeed * .045; else if (item.id === 'compass') needle.rotation.z = -flight.heading * Math.PI / 180; else if (item.id === 'rpm') needle.rotation.z = -(flight.rpm - 1800) * .001; }
-      const selected = instruments.find((item) => item.title === root.querySelector('#sim-info-title').textContent); if (selected) root.querySelector('#sim-info-reading').textContent = selected.get(flight);
       yoke.rotation.x = THREE.MathUtils.degToRad(-flight.pitch * .7); yoke.rotation.z = THREE.MathUtils.degToRad(-flight.bank * .58);
       horizonGroup.rotation.z = THREE.MathUtils.degToRad(-flight.bank * .48); horizonGroup.position.y = -flight.pitch * .045;
     };
     const animate = (time) => {
-      if (disposed) return;
+      if (disposed || !active) { animationRunning = false; return; }
       animationId = requestAnimationFrame(animate);
-      if (!active) return;
       const dt = Math.min(.05, Math.max(0, (time - lastFrame) / 1000)); lastFrame = time;
       if (!paused) {
         const pitchInput = (held.has('w') ? 1 : 0) - (held.has('s') ? 1 : 0);
@@ -190,9 +207,15 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
         if (held.has('q')) cameraYaw = THREE.MathUtils.clamp(cameraYaw - .8 * dt, -1.0, 1.0); if (held.has('e')) cameraYaw = THREE.MathUtils.clamp(cameraYaw + .8 * dt, -1.0, 1.0);
         if (held.has('q') || held.has('e')) updateCamera(THREE);
       }
-      updateReadouts(); renderer.render(scene, camera);
+      updateReadouts(time); renderer.render(scene, camera);
     };
-    animate(performance.now());
+    const startAnimation = () => {
+      if (disposed || !active || animationRunning) return;
+      animationRunning = true;
+      lastFrame = performance.now();
+      animationId = requestAnimationFrame(animate);
+    };
+    startAnimation();
     canvasHost.addEventListener('pointerdown', () => canvasHost.focus?.());
     canvasHost.tabIndex = 0;
     root.querySelectorAll('[data-flight-key]').forEach((button) => {
@@ -208,10 +231,20 @@ export function initializeSimulator(container, { onExit = () => {}, onInstrument
       if (button.dataset.simAction === 'restart') { Object.assign(flight, defaultFlight); cameraYaw = 0; cameraPitch = .03; cameraDistance = 9.3; updateCamera(THREE); setPaused(false); setInfo(instruments[0]); }
     }));
     setInfo(instruments[0]); if (active) setState('В ПОЛЁТЕ', 'ready'); else setPaused(true);
-    return { ready: true, setActive(value) { active = Boolean(value); if (!active) setPaused(true); else { resize(); lastFrame = performance.now(); } }, setPaused, dispose() {
-      if (disposed) return; disposed = true; cancelAnimationFrame(animationId); resizeObserver?.disconnect(); window.removeEventListener('keydown', keyDown); window.removeEventListener('keyup', keyUp);
+    return { ready: true, setActive(value) { active = Boolean(value); if (!active) { setPaused(true); cancelAnimationFrame(animationId); animationRunning = false; } else { resize(); startAnimation(); } }, setPaused, dispose() {
+      if (disposed) return; disposed = true; active = false; held.clear(); cancelAnimationFrame(animationId); animationRunning = false; resizeObserver?.disconnect(); window.removeEventListener('keydown', keyDown); window.removeEventListener('keyup', keyUp);
       renderer.domElement.removeEventListener('pointermove', pointerMove); renderer.domElement.removeEventListener('pointerdown', pointerDown); renderer.domElement.removeEventListener('pointerup', pointerUp); renderer.domElement.removeEventListener('pointercancel', pointerUp); renderer.domElement.removeEventListener('wheel', wheelZoom);
-      root.querySelectorAll('[data-flight-key]').forEach((button) => button._simCleanup?.()); renderer.dispose(); scene.traverse((object) => { object.geometry?.dispose?.(); if (Array.isArray(object.material)) object.material.forEach((material) => material.dispose()); else object.material?.dispose?.(); });
+      root.querySelectorAll('[data-flight-key]').forEach((button) => button._simCleanup?.());
+      scene.traverse((object) => {
+        object.geometry?.dispose?.();
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        for (const material of materials) {
+          if (!material) continue;
+          for (const value of Object.values(material)) if (value?.isTexture) value.dispose();
+          material.dispose();
+        }
+      });
+      renderer.dispose(); renderer.domElement.remove();
     } };
   };
   const controls = root.querySelectorAll('[data-sim-action]');
